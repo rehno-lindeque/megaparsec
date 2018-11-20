@@ -321,7 +321,7 @@ instance MonadTrans (ParsecT e s) where
   lift amb = ParsecT $ \s _ _ eok _ ->
     ParseResult (amb >>= \a -> unParseResult (eok a s mempty))
 
-instance (Ord e, Stream s) => MonadParsec e s (ParsecT e s m) where
+instance (Ord e, Stream s, Functor m) => MonadParsec e s (ParsecT e s m) where
   failure           = pFailure
   fancyFailure      = pFancyFailure
   label             = pLabel
@@ -435,23 +435,26 @@ pEof = ParsecT $ \s@(State input o pst) _ _ eok eerr ->
           (State input o pst)
 {-# INLINE pEof #-}
 
-pToken :: forall e s m a. Stream s
+pToken :: forall e s m a. (Stream s, Functor m)
   => (Token s -> Maybe a)
   -> Set (ErrorItem (Token s))
   -> ParsecT e s m a
-pToken test ps = ParsecT $ \s@(State input o pst) cok _ _ eerr ->
-  case take1_ input of
-    Nothing ->
-      let us = pure EndOfInput
-      in eerr (TrivialError o us ps) s
-    Just (c,cs) ->
-      case test c of
-        Nothing ->
-          let us = (Just . Tokens . nes) c
-          in eerr (TrivialError o us ps)
-                  (State input o pst)
-        Just x ->
-          cok x (State cs (o + 1) pst) mempty
+pToken test ps = ParsecT $ \originalState cok _ _ eerr ->
+  let go = \s@(State input o pst) ->
+        case take1_ input of
+          Nothing ->
+            let us = pure EndOfInput
+                await = ParseResult . fmap (\(x,_) -> (x, go)) . unParseResult
+            in await (eerr (TrivialError o us ps) s)
+          Just (c,cs) ->
+            case test c of
+              Nothing ->
+                let us = (Just . Tokens . nes) c
+                in eerr (TrivialError o us ps)
+                        (State input o pst)
+              Just x ->
+                cok x (State cs (o + 1) pst) mempty
+  in go originalState
 {-# INLINE pToken #-}
 
 pTokens :: forall e s m. Stream s
