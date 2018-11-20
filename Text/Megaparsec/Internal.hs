@@ -117,17 +117,25 @@ data Result s e a
   = OK a                   -- ^ Parser succeeded
   | Error (ParseError s e) -- ^ Parser failed
 
+newtype ParseResult s m r = ParseResult { unParseResult :: m (r, State s -> ParseResult s m r) }
+
+instance Functor m => Functor (ParseResult s m) where
+  fmap f = ParseResult . fmap (\(x, contX) -> (f x, (fmap . fmap) f contX)) . unParseResult
+
+fixedParseResult :: Applicative m => m r -> ParseResult s m r
+fixedParseResult mx = ParseResult (fmap (\x -> (x, const (fixedParseResult (pure x)))) mx)
+
 -- | @'ParsecT' e s m a@ is a parser with custom data component of error
 -- @e@, stream type @s@, underlying monad @m@ and return type @a@.
 
 newtype ParsecT e s m a = ParsecT
   { unParser
       :: forall b. State s
-      -> (a -> State s   -> Hints (Token s) -> m b) -- consumed-OK
-      -> (ParseError s e -> State s         -> m b) -- consumed-error
-      -> (a -> State s   -> Hints (Token s) -> m b) -- empty-OK
-      -> (ParseError s e -> State s         -> m b) -- empty-error
-      -> m b }
+      -> (a -> State s   -> Hints (Token s) -> ParseResult s m b) -- consumed-OK
+      -> (ParseError s e -> State s         -> ParseResult s m b) -- consumed-error
+      -> (a -> State s   -> Hints (Token s) -> ParseResult s m b) -- empty-OK
+      -> (ParseError s e -> State s         -> ParseResult s m b) -- empty-error
+      -> ParseResult s m b }
 
 -- | @since 5.3.0
 
@@ -153,7 +161,7 @@ instance (Stream s, Monoid a) => Monoid (ParsecT e s m a) where
 
 -- | @since 6.3.0
 
-instance (a ~ Tokens s, IsString a, Eq a, Stream s, Ord e)
+instance (a ~ Tokens s, IsString a, Eq a, Stream s, Ord e, Functor m)
     => IsString (ParsecT e s m a) where
   fromString s = tokens (==) (fromString s)
 
@@ -247,17 +255,21 @@ instance (Stream s, MonadError e' m) => MonadError e' (ParsecT e s m) where
       runParsecT (h e) s
 
 mkPT :: Monad m => (State s -> m (Reply e s a)) -> ParsecT e s m a
-mkPT k = ParsecT $ \s cok cerr eok eerr -> do
-  (Reply s' consumption result) <- k s
-  case consumption of
-    Consumed ->
-      case result of
-        OK    x -> cok x s' mempty
-        Error e -> cerr e s'
-    Virgin ->
-      case result of
-        OK    x -> eok x s' mempty
-        Error e -> eerr e s'
+mkPT k = ParsecT $ \s cok cerr eok eerr ->
+  let go = do
+        (Reply s' consumption result) <- k s
+        unParseResult $
+          case consumption of
+            Consumed ->
+              case result of
+                OK    x -> cok x s' mempty
+                Error e -> cerr e s'
+            Virgin ->
+              case result of
+                OK    x -> eok x s' mempty
+                Error e -> eerr e s'
+  in
+    ParseResult go
 
 -- | 'mzero' is a parser that __fails__ without consuming input.
 
@@ -307,7 +319,7 @@ instance (Stream s, MonadFix m) => MonadFix (ParsecT e s m) where
 
 instance MonadTrans (ParsecT e s) where
   lift amb = ParsecT $ \s _ _ eok _ ->
-    amb >>= \a -> eok a s mempty
+    ParseResult (amb >>= \a -> unParseResult (eok a s mempty))
 
 instance (Ord e, Stream s) => MonadParsec e s (ParsecT e s m) where
   failure           = pFailure
@@ -604,12 +616,12 @@ runParsecT :: Monad m
   => ParsecT e s m a -- ^ Parser to run
   -> State s       -- ^ Initial state
   -> m (Reply e s a)
-runParsecT p s = unParser p s cok cerr eok eerr
+runParsecT p s = fmap fst (unParseResult (unParser p s cok cerr eok eerr))
   where
-    cok a s' _  = return $ Reply s' Consumed (OK a)
-    cerr err s' = return $ Reply s' Consumed (Error err)
-    eok a s' _  = return $ Reply s' Virgin   (OK a)
-    eerr err s' = return $ Reply s' Virgin   (Error err)
+    cok a s' _  = fixedParseResult (return (Reply s' Consumed (OK a)))
+    cerr err s' = fixedParseResult (return (Reply s' Consumed (Error err)))
+    eok a s' _  = fixedParseResult (return (Reply s' Virgin   (OK a)))
+    eerr err s' = fixedParseResult (return (Reply s' Virgin   (Error err)))
 
 -- | Transform any custom errors thrown by the parser using the given
 -- function. Similar in function and purpose to @withExceptT@.
