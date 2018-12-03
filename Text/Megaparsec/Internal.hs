@@ -117,17 +117,43 @@ data Result s e a
   = OK a                   -- ^ Parser succeeded
   | Error (ParseError s e) -- ^ Parser failed
 
+-- | 'ParseResult' wraps two thunks. One represents the end state where no further input is to be provided and the other
+--   is a continuation where additional input can be given.
+newtype ParseResult s m r = ParseResult { unParseResult :: (m r, m ((State s -> State s) -> ParseResult s m r)) }
+
+instance Functor m => Functor (ParseResult s m) where
+  fmap f = ParseResult . (\(mx, mcontx) -> (fmap f mx, (fmap . fmap . fmap) f mcontx)) . unParseResult
+instance Applicative m => Applicative (ParseResult s m) where
+  pure      = ParseResult . (\x -> (pure x, pure (const (pure x))))
+  p1 <*> p2 =
+    let (mf, mcontf) = unParseResult p1
+        (mx, mcontx) = unParseResult p2
+    in
+      -- Not a commutative applicative functor
+      -- Simultaneous rather than sequential
+      -- (I'm dubious as to whether this is a good idea)
+      ParseResult (mf <*> mx, liftA2 (\contf contx s -> contf s <*> contx s) mcontf mcontx)
+  -- p1 *> p2  = p1 `pBind` const p2
+  -- p1 <* p2  = do { x1 <- p1 ; void p2 ; return x1 }
+-- instance (Monoid a) => Monoid (ParseResult s m a) where
+--   mempty = pure mempty
+--   mappend = liftA2 mappend
+--   mconcat = _
+
+fixedParseResult :: Applicative m => m r -> ParseResult s m r
+fixedParseResult mx = ParseResult (mx, pure (const (fixedParseResult mx)))
+
 -- | @'ParsecT' e s m a@ is a parser with custom data component of error
 -- @e@, stream type @s@, underlying monad @m@ and return type @a@.
 
 newtype ParsecT e s m a = ParsecT
   { unParser
       :: forall b. State s
-      -> (a -> State s   -> Hints (Token s) -> m b) -- consumed-OK
-      -> (ParseError s e -> State s         -> m b) -- consumed-error
-      -> (a -> State s   -> Hints (Token s) -> m b) -- empty-OK
-      -> (ParseError s e -> State s         -> m b) -- empty-error
-      -> m b }
+      -> (a -> State s   -> Hints (Token s) -> ParseResult s m b) -- consumed-OK
+      -> (ParseError s e -> State s         -> ParseResult s m b) -- consumed-error
+      -> (a -> State s   -> Hints (Token s) -> ParseResult s m b) -- empty-OK
+      -> (ParseError s e -> State s         -> ParseResult s m b) -- empty-error
+      -> ParseResult s m b }
 
 -- | @since 5.3.0
 
@@ -153,7 +179,7 @@ instance (Stream s, Monoid a) => Monoid (ParsecT e s m a) where
 
 -- | @since 6.3.0
 
-instance (a ~ Tokens s, IsString a, Eq a, Stream s, Ord e)
+instance (a ~ Tokens s, IsString a, Eq a, Stream s, Ord e, Applicative m)
     => IsString (ParsecT e s m a) where
   fromString s = tokens (==) (fromString s)
 
@@ -228,36 +254,92 @@ instance (Stream s, MonadIO m) => MonadIO (ParsecT e s m) where
 
 instance (Stream s, MonadReader r m) => MonadReader r (ParsecT e s m) where
   ask       = lift ask
-  local f p = mkPT $ \s -> local f (runParsecT p s)
+  local f p = mapParsecT (local f) p
 
 instance (Stream s, MonadState st m) => MonadState st (ParsecT e s m) where
   get = lift get
   put = lift . put
 
 instance (Stream s, MonadCont m) => MonadCont (ParsecT e s m) where
-  callCC f = mkPT $ \s ->
-    callCC $ \c ->
-      runParsecT (f (\a -> mkPT $ \s' -> c (pack s' a))) s
+  -- Original implementation:
+  -- callCC f = mkPT $ \s ->
+  --   callCC $ \c ->
+  --     runParsecT (f (\a -> mkPT $ \s' -> c (pack s' a))) s
+  --   where pack s a = Reply s Virgin (OK a)
+
+  -- Experimental implementation:
+  callCC (f :: (a -> ParsecT e s m b) -> ParsecT e s m a) =
+    mkPT $ \s ->
+      let cok a s' _  = fixedParseResult (return (Reply s' Consumed (OK a)))
+          cerr err s' = fixedParseResult (return (Reply s' Consumed (Error err)))
+          eok a s' _  = fixedParseResult (return (Reply s' Virgin   (OK a)))
+          eerr err s' = fixedParseResult (return (Reply s' Virgin   (Error err)))
+          go = callCC $ \(c :: Reply e s a -> m (Reply e s b)) ->
+            fst (unParseResult (unParser (f $ \a ->
+              ParsecT $ \s' _ _ eok' _  ->
+                -- fixedParseResult (c (pack s a) >>= \(Reply s' _ (OK b)) -> fst (unParseResult (eok' b s' mempty)))
+                ParseResult
+                  ( c (pack s a) >>= \(Reply s' _ (OK b)) -> fst (unParseResult (eok' b s' mempty))
+                  , c (pack s a) >>= \(Reply s' _ (OK b)) -> snd (unParseResult (eok' b s' mempty))
+                  )
+            ) s cok cerr eok eerr))
+      in
+        ParseResult $
+           ( go
+           , undefined
+           )
     where pack s a = Reply s Virgin (OK a)
 
-instance (Stream s, MonadError e' m) => MonadError e' (ParsecT e s m) where
-  throwError = lift . throwError
-  p `catchError` h = mkPT $ \s ->
-    runParsecT p s `catchError` \e ->
-      runParsecT (h e) s
+  -- Alternate implementation using mkPT:
+  -- callCC (f :: (a -> ParsecT e s m b) -> ParsecT e s m a) =
+  --   mkPT $ \s ->
+  --     let cok a s' _  = fixedParseResult (pure (Reply s' Consumed (OK a)))
+  --         cerr err s' = fixedParseResult (pure (Reply s' Consumed (Error err)))
+  --         eok a s' _  = fixedParseResult (pure (Reply s' Virgin   (OK a)))
+  --         eerr err s' = fixedParseResult (pure (Reply s' Virgin   (Error err)))
+  --         run p = unParser p s cok cerr eok eerr :: ParseResult s m (Reply e s a)
+  --     in
+  --       ParseResult $
+  --          ( callCC $ \(c :: Reply e s a -> m (Reply e s b)) -> fst (unParseResult (run (f $ \a -> mkPT $ \s' -> fixedParseResult $ c $ pack s' a)))
+  --          , callCC $ \c -> snd $ unParseResult $ run $ f $ \a -> mkPT $ \s' ->
+  --              fixedParseResult $ c (\advanceState -> fixedParseResult (pure (pack s' a)))
+  --          )
+  --   where pack s a = Reply s Virgin (OK a)
 
-mkPT :: Monad m => (State s -> m (Reply e s a)) -> ParsecT e s m a
-mkPT k = ParsecT $ \s cok cerr eok eerr -> do
-  (Reply s' consumption result) <- k s
-  case consumption of
-    Consumed ->
-      case result of
-        OK    x -> cok x s' mempty
-        Error e -> cerr e s'
-    Virgin ->
-      case result of
-        OK    x -> eok x s' mempty
-        Error e -> eerr e s'
+
+
+mapParsecT :: Functor m => (forall b. m b -> m b) -> ParsecT e s m a -> ParsecT e s m a
+mapParsecT f p = ParsecT $ \s cok cerr eok eerr ->
+  -- let go mx = (ParseResult . (\(r,cont) -> (f r, (fmap . fmap) go (f cont))) . unParseResult) mx
+  let go mx = (ParseResult . (\(r,cont) -> (f r, f cont)) . unParseResult) mx
+  in go (unParser p s cok cerr eok eerr)
+
+-- instance (Stream s, MonadError e' m) => MonadError e' (ParsecT e s m) where
+--   throwError = lift . throwError
+--   p `catchError` h = mkPT $ \s ->
+--     runParsecT p s `catchError` \e ->
+--       runParsecT (h e) s
+
+mkPT :: forall e s m a. Monad m => (State s -> ParseResult s m (Reply e s a)) -> ParsecT e s m a
+mkPT k = ParsecT $
+  let go pr cok cerr eok eerr = ParseResult $
+        let (mr :: m (Reply e s a), mcont :: m ((State s -> State s) -> ParseResult s m (Reply e s a))) = unParseResult pr
+        in
+          ( do
+              (Reply s' consumption result) <- mr
+              fst . unParseResult $
+                case consumption of
+                  Consumed ->
+                    case result of
+                      OK    x -> cok x s' mempty
+                      Error e -> cerr e s'
+                  Virgin ->
+                    case result of
+                      OK    x -> eok x s' mempty
+                      Error e -> eerr e s'
+          , fmap (\cont advanceState -> go (cont advanceState) cok cerr eok eerr) mcont
+          )
+  in go . k
 
 -- | 'mzero' is a parser that __fails__ without consuming input.
 
@@ -297,19 +379,19 @@ longestMatch s1@(State _ o1 _) s2@(State _ o2 _) =
 
 -- | @since 6.0.0
 
-instance (Stream s, MonadFix m) => MonadFix (ParsecT e s m) where
-  mfix f = mkPT $ \s -> mfix $ \(~(Reply _ _ result)) -> do
-    let
-      a = case result of
-        OK a' -> a'
-        Error _ -> error "mfix ParsecT"
-    runParsecT (f a) s
+-- instance (Stream s, MonadFix m) => MonadFix (ParsecT e s m) where
+--   mfix f = mkPT $ \s -> mfix $ \(~(Reply _ _ result)) -> do
+--     let
+--       a = case result of
+--         OK a' -> a'
+--         Error _ -> error "mfix ParsecT"
+--     runParsecT (f a) s
 
 instance MonadTrans (ParsecT e s) where
   lift amb = ParsecT $ \s _ _ eok _ ->
-    amb >>= \a -> eok a s mempty
+    ParseResult (amb >>= \a -> fst $ unParseResult (eok a s mempty), amb >>= \a -> snd $ unParseResult (eok a s mempty))
 
-instance (Ord e, Stream s) => MonadParsec e s (ParsecT e s m) where
+instance (Ord e, Stream s, Applicative m) => MonadParsec e s (ParsecT e s m) where
   failure           = pFailure
   fancyFailure      = pFancyFailure
   label             = pLabel
@@ -423,47 +505,54 @@ pEof = ParsecT $ \s@(State input o pst) _ _ eok eerr ->
           (State input o pst)
 {-# INLINE pEof #-}
 
-pToken :: forall e s m a. Stream s
+pToken :: forall e s m a. (Stream s, Applicative m)
   => (Token s -> Maybe a)
   -> Set (ErrorItem (Token s))
   -> ParsecT e s m a
-pToken test ps = ParsecT $ \s@(State input o pst) cok _ _ eerr ->
-  case take1_ input of
-    Nothing ->
-      let us = pure EndOfInput
-      in eerr (TrivialError o us ps) s
-    Just (c,cs) ->
-      case test c of
-        Nothing ->
-          let us = (Just . Tokens . nes) c
-          in eerr (TrivialError o us ps)
-                  (State input o pst)
-        Just x ->
-          cok x (State cs (o + 1) pst) mempty
+pToken test ps = ParsecT $ \originalState cok _ _ eerr ->
+  let go = \s@(State input o pst) ->
+        case take1_ input of
+          Nothing ->
+            let us = pure EndOfInput
+                await = ParseResult . (\(x,_) -> (x, pure $ \advanceState -> go (advanceState s))) . unParseResult
+            in await (eerr (TrivialError o us ps) s)
+          Just (c,cs) ->
+            case test c of
+              Nothing ->
+                let us = (Just . Tokens . nes) c
+                in eerr (TrivialError o us ps) s
+              Just x ->
+                cok x (State cs (o + 1) pst) mempty
+  in go originalState
 {-# INLINE pToken #-}
 
-pTokens :: forall e s m. Stream s
+pTokens :: forall e s m. (Stream s, Applicative m)
   => (Tokens s -> Tokens s -> Bool)
   -> Tokens s
   -> ParsecT e s m (Tokens s)
-pTokens f tts = ParsecT $ \s@(State input o pst) cok _ eok eerr ->
+pTokens f tts = ParsecT $ \originalState cok _ eok eerr ->
   let pxy = Proxy :: Proxy s
       unexpect pos' u =
         let us = pure u
             ps = (E.singleton . Tokens . NE.fromList . chunkToTokens pxy) tts
         in TrivialError pos' us ps
       len = chunkLength pxy tts
-  in case takeN_ len input of
-    Nothing ->
-      eerr (unexpect o EndOfInput) s
-    Just (tts', input') ->
-      if f tts tts'
-        then let st = State input' (o + len) pst
-             in if chunkEmpty pxy tts
-                  then eok tts' st mempty
-                  else cok tts' st mempty
-        else let ps = (Tokens . NE.fromList . chunkToTokens pxy) tts'
-             in eerr (unexpect o ps) (State input o pst)
+      go = \s@(State input o pst) ->
+        let await = ParseResult . (\(x,_) -> (x, pure $ \advanceState -> go (advanceState s))) . unParseResult
+        in case takeN_ len input of
+          Nothing ->
+            await (eerr (unexpect o EndOfInput) s)
+          Just (tts', input') ->
+            let ps = (Tokens . NE.fromList . chunkToTokens pxy) tts'
+            in if chunkLength pxy tts' < len
+              then await (eerr (unexpect o ps) s)
+              else if f tts tts'
+                then let st = State input' (o + len) pst
+                     in if chunkEmpty pxy tts
+                          then eok tts' st mempty
+                          else cok tts' st mempty
+                else eerr (unexpect o ps) s
+  in go originalState
 {-# INLINE pTokens #-}
 
 pTakeWhileP :: forall e s m. Stream s
@@ -603,13 +692,13 @@ refreshLastHint (Hints (_:xs)) (Just m) = Hints (E.singleton m : xs)
 runParsecT :: Monad m
   => ParsecT e s m a -- ^ Parser to run
   -> State s       -- ^ Initial state
-  -> m (Reply e s a)
-runParsecT p s = unParser p s cok cerr eok eerr
+  -> (m (Reply e s a), m ((State s -> State s) -> ParseResult s m (Reply e s a)))
+runParsecT p s = unParseResult (unParser p s cok cerr eok eerr)
   where
-    cok a s' _  = return $ Reply s' Consumed (OK a)
-    cerr err s' = return $ Reply s' Consumed (Error err)
-    eok a s' _  = return $ Reply s' Virgin   (OK a)
-    eerr err s' = return $ Reply s' Virgin   (Error err)
+    cok a s' _  = fixedParseResult (pure (Reply s' Consumed (OK a)))
+    cerr err s' = fixedParseResult (pure (Reply s' Consumed (Error err)))
+    eok a s' _  = fixedParseResult (pure (Reply s' Virgin   (OK a)))
+    eerr err s' = fixedParseResult (pure (Reply s' Virgin   (Error err)))
 
 -- | Transform any custom errors thrown by the parser using the given
 -- function. Similar in function and purpose to @withExceptT@.

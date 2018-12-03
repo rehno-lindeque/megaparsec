@@ -250,7 +250,7 @@ runParserT' :: Monad m
   -> State s       -- ^ Initial state
   -> m (State s, Either (ParseErrorBundle s e) a)
 runParserT' p s = do
-  (Reply s' _ result) <- runParsecT p s
+  (Reply s' _ result) <- fst (runParsecT p s)
   return $ case result of
     OK    x -> (s', Right x)
     Error e ->
